@@ -171,8 +171,8 @@ void NightshadeAudioProcessor::updateFilters (float tone)
         // Logarithmic frequency sweep:  200 Hz at tone=0, 8 kHz at tone=1
         const double fc = 200.0 * std::pow (8000.0 / 200.0, static_cast<double> (tone));
 
-        auto lpC = juce::dsp::IIR::Coefficients<float>::makeLowPass  (fs, fc, 0.707);
-        auto hpC = juce::dsp::IIR::Coefficients<float>::makeHighPass (fs, fc, 0.707);
+        auto lpC = juce::dsp::IIR::Coefficients<float>::makeFirstOrderLowPass  (fs, fc);
+        auto hpC = juce::dsp::IIR::Coefficients<float>::makeFirstOrderHighPass (fs, fc);
 
         for (auto& ch : channels)
         {
@@ -380,6 +380,12 @@ void NightshadeAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
             const float lpOut = state.toneLPF.processSample (x);
             const float hpOut = state.toneHPF.processSample (x);
             x = lpWeight * lpOut + hpWeight * hpOut;
+
+            // Makeup gain — compensates for the tone pot insertion loss.
+            // The passive RC blend loses up to 6 dB at the mid position
+            // (tone=0.5); the real circuit's SECRETB second op-amp provides
+            // a fixed ~6 dB recovery, modelled here as a constant 2× gain.
+            x *= 2.0f;
 
             // Output LPF — gain-dependent 47 pF feedback cap model.
             // At high gain this rolls off ~6.6 kHz, adding smoothness.
