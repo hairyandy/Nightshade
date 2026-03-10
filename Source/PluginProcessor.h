@@ -1,5 +1,4 @@
 #pragma once
-
 #include <JuceHeader.h>
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -7,20 +6,24 @@
 // ─────────────────────────────────────────────────────────────────────────────
 enum class ClipMode : int
 {
-    LED       = 0,  // Soft, symmetric       — LEDs in feedback (real circuit)
-    Silicon   = 1,  // Medium, symmetric     — 1N4148 model
-    Germanium = 2,  // Warm, asymmetric      — 1N34A model (even harmonics)
-    None      = 3   // No diodes             — op-amp rail saturation only
+    LED       = 0,
+    Silicon   = 1,
+    Germanium = 2,
+    None      = 3
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Per-channel biquad filter state
+//  Per-channel filter state
+//  All filters run at base sample rate except the clipper, which runs at 4×
+//  inside the oversampler block.
 // ─────────────────────────────────────────────────────────────────────────────
 struct ChannelState
 {
-    juce::dsp::IIR::Filter<float> inputHPF;    // input coupling cap model
-    juce::dsp::IIR::Filter<float> toneFilter;  // sweepable tone stack
-    juce::dsp::IIR::Filter<float> outputLPF;   // HF rolloff / stability
+    juce::dsp::IIR::Filter<float> inputHPF;    // pre-gain  — 1591 Hz coupling cap model
+    juce::dsp::IIR::Filter<float> warmthLPF;   // post-clip — 6 kHz one-pole warmth
+    juce::dsp::IIR::Filter<float> toneLPF;     // tone LP path (blended)
+    juce::dsp::IIR::Filter<float> toneHPF;     // tone HP path (blended)
+    juce::dsp::IIR::Filter<float> outputLPF;   // post-tone — gain-dependent 47 pF model
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -37,7 +40,6 @@ public:
     bool isBusesLayoutSupported (const BusesLayout&) const override;
     void processBlock (juce::AudioBuffer<float>&, juce::MidiBuffer&) override;
 
-    // Explicitly disable double-precision so hosts always call the float path
     bool supportsDoublePrecisionProcessing() const override { return false; }
 
     juce::AudioProcessorEditor* createEditor() override;
@@ -58,32 +60,33 @@ public:
     void getStateInformation (juce::MemoryBlock&) override;
     void setStateInformation (const void*, int) override;
 
-    // Public so the editor can bind to it
     juce::AudioProcessorValueTreeState apvts;
     static juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout();
 
 private:
-    // ── Clipping functions ────────────────────────────────────────────────
-    // f(x, Vf) = (Vf / tanh(1)) * tanh(x / Vf)
-    //   - Slope = 1 at x = 0  (unity gain for small signals)
-    //   - Saturates to ± Vf   (hard ceiling set by forward voltage)
-    // Dividing by Vf afterwards normalises the output to ± 1.
+    // ── Waveshaper ────────────────────────────────────────────────────────
+    // f(x) = Vf * asinh(x / Vf)  — unity gain for small x, log compression above Vf
     static float diodeClip (float x, float Vf) noexcept;
     static float opAmpSat  (float x) noexcept;
     static float applyClipping (float x, int mode) noexcept;
 
     // ── Filter management ─────────────────────────────────────────────────
-    void updateFilters (float tone);
+    void updateFilters    (float tone);
+    void updateOutputLPF  (float gainKnob);
 
     // ── DSP state ─────────────────────────────────────────────────────────
     double currentSampleRate { 44100.0 };
     std::array<ChannelState, 2> channels;
-    float lastTone { -1.0f };
 
-    // Raw APVTS parameter pointers — cached in the constructor so they are
-    // valid for the entire lifetime of the processor, including the very
-    // first processBlock call.  Reading an atomic<float>* on the audio
-    // thread is lock-free and safe.
+    float lastTone     { -1.0f };
+    float lastGainKnob { -1.0f };
+
+    // 4× oversampler — used exclusively for the clipping stage to prevent aliasing.
+    // Constructed with 2 channels, factor 2 (2^2 = 4×).
+    juce::dsp::Oversampling<float> oversampler {
+        2, 2, juce::dsp::Oversampling<float>::filterHalfBandPolyphaseIIR };
+
+    // Direct APVTS parameter pointers — cached in constructor, always valid.
     std::atomic<float>* rawGain { nullptr };
     std::atomic<float>* rawTone { nullptr };
     std::atomic<float>* rawVol  { nullptr };

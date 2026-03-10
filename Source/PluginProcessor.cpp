@@ -11,34 +11,31 @@ static const juce::String kVolID  = "vol";
 static const juce::String kClipID = "clipmode";
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Clipping thresholds
+//  Waveshaper forward voltages
 //
-//  Vf is the "forward voltage" constant that sets the knee of each clipper.
-//  Used inside:  f(x) = (Vf / tanh(1)) * tanh(x / Vf)  which gives:
-//    - slope = 1 at x = 0   (unity gain — no attenuation of quiet signals)
-//    - hard ceiling at ± Vf  (then normalised to ± 1 by dividing by Vf)
-//  Smaller Vf → knee occurs at a lower drive level → harder / earlier clip.
+//  f(x) = Vf * asinh(x / Vf)
+//    - slope = 1 at x = 0  (unity gain, no attenuation of quiet signals)
+//    - compresses logarithmically above |x| ≈ Vf
+//
+//  As specified in the plugin design brief:
+//    LED      symmetric:  Vf = 2.0
+//    Silicon  symmetric:  Vf = 0.6
+//    Germanium asymmetric: Vf_pos = 0.3, Vf_neg = 0.5  (adds even harmonics)
+//    None     tanh × 3.0  (hard op-amp rail saturation)
 // ─────────────────────────────────────────────────────────────────────────────
-// Normalisation constant: tanh(1) ≈ 0.7616 — ensures slope = 1 at x = 0
-static const float kTanh1 = std::tanh (1.0f);
+static constexpr float kVf_LED    = 2.0f;
+static constexpr float kVf_Si     = 0.6f;
+static constexpr float kVf_Ge_pos = 0.3f;
+static constexpr float kVf_Ge_neg = 0.5f;
 
-static constexpr float kVf_LED    = 2.00f;  // gentle — LEDs in feedback (real circuit)
-static constexpr float kVf_Si     = 0.60f;  // medium — 1N4148 silicon diode
-static constexpr float kVf_Ge_pos = 0.30f;  // hard positive half — 1N34A germanium
-static constexpr float kVf_Ge_neg = 0.25f;  // harder negative half (asymmetric even harmonics)
-static constexpr float kVf_None   = 0.40f;  // tightest — op-amp rail limiting
-
 // ─────────────────────────────────────────────────────────────────────────────
-//  Gain staging — derived from the Nightshade schematic:
-//
-//    R6 (input resistor)          =   1 kΩ
-//    R2 (feedback, sets min gain) =  10 kΩ   → min gain = 10k / 1k = 10×
-//    GAIN pot                     = 500 kΩ   → max gain = 510k / 1k = 510×
-//
-//  knob [0, 1] is mapped through log-space so the sweep feels linear in dB.
+//  Gain range  — from the Nightshade schematic
+//  R6 (input) = 1 kΩ,  R2 (fixed feedback) = 10 kΩ,  GAIN pot = 500 kΩ
+//    min gain = R2 / R6          = 10k / 1k   = 10×  (+20 dB)
+//    max gain = (R2 + R5) / R6   = 510k / 1k  = 510× (+54 dB)
 // ─────────────────────────────────────────────────────────────────────────────
-static constexpr float kGainMin = 10.0f;    // R2 / R6
-static constexpr float kGainMax = 510.0f;   // (R2 + Rgain) / R6
+static constexpr float kGainMin = 10.0f;
+static constexpr float kGainMax = 510.0f;
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Parameter layout
@@ -60,7 +57,6 @@ NightshadeAudioProcessor::createParameterLayout()
         kVolID, "Vol",
         juce::NormalisableRange<float> (0.0f, 1.0f, 0.001f), 0.75f));
 
-    // AudioParameterChoice raw value is the integer index (0, 1, 2, 3)
     layout.add (std::make_unique<juce::AudioParameterChoice> (
         kClipID, "Clip Mode",
         juce::StringArray { "LED", "Silicon", "Germanium", "None" }, 0));
@@ -70,9 +66,8 @@ NightshadeAudioProcessor::createParameterLayout()
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Constructor
-//  IMPORTANT: APVTS parameter pointers are cached HERE so they are valid
-//  for the entire processor lifetime — including any processBlock call that
-//  might theoretically arrive before prepareToPlay in some hosts.
+//  Parameter pointers are cached here so they are valid for the entire
+//  processor lifetime, including any early processBlock call.
 // ─────────────────────────────────────────────────────────────────────────────
 NightshadeAudioProcessor::NightshadeAudioProcessor()
     : AudioProcessor (BusesProperties()
@@ -80,14 +75,11 @@ NightshadeAudioProcessor::NightshadeAudioProcessor()
                           .withOutput ("Output", juce::AudioChannelSet::stereo(), true)),
       apvts (*this, nullptr, "NightshadeState", createParameterLayout())
 {
-    // Cache direct pointers into the APVTS parameter atomics.
-    // These are std::atomic<float>* — lock-free reads are safe on the audio thread.
     rawGain = apvts.getRawParameterValue (kGainID);
     rawTone = apvts.getRawParameterValue (kToneID);
     rawVol  = apvts.getRawParameterValue (kVolID);
     rawClip = apvts.getRawParameterValue (kClipID);
 
-    // Paranoia check — these must never be null after APVTS construction
     jassert (rawGain != nullptr && rawTone != nullptr &&
              rawVol  != nullptr && rawClip != nullptr);
 }
@@ -101,31 +93,45 @@ void NightshadeAudioProcessor::prepareToPlay (double sampleRate, int samplesPerB
 {
     currentSampleRate = sampleRate;
 
+    // Prepare base-rate per-channel filters
     juce::dsp::ProcessSpec spec;
     spec.sampleRate       = sampleRate;
     spec.maximumBlockSize = static_cast<juce::uint32> (samplesPerBlock);
-    spec.numChannels      = 1;   // each ChannelState owns one channel
+    spec.numChannels      = 1;
 
     for (auto& ch : channels)
     {
         ch.inputHPF.prepare   (spec);
-        ch.toneFilter.prepare (spec);
+        ch.warmthLPF.prepare  (spec);
+        ch.toneLPF.prepare    (spec);
+        ch.toneHPF.prepare    (spec);
         ch.outputLPF.prepare  (spec);
 
         ch.inputHPF.reset();
-        ch.toneFilter.reset();
+        ch.warmthLPF.reset();
+        ch.toneLPF.reset();
+        ch.toneHPF.reset();
         ch.outputLPF.reset();
     }
 
-    // Build filter coefficients using the current tone value
-    lastTone = -1.0f;
-    updateFilters (rawTone->load());
+    // Prepare 4× oversampler
+    oversampler.initProcessing (static_cast<size_t> (samplesPerBlock));
+    oversampler.reset();
+
+    // Build initial filter coefficients
+    lastTone     = -1.0f;
+    lastGainKnob = -1.0f;
+    updateFilters    (rawTone->load());
+    updateOutputLPF  (rawGain->load());
 }
 
-void NightshadeAudioProcessor::releaseResources() {}
+void NightshadeAudioProcessor::releaseResources()
+{
+    oversampler.reset();
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  updateFilters
+//  updateFilters  — tone-dependent coefficients
 // ─────────────────────────────────────────────────────────────────────────────
 void NightshadeAudioProcessor::updateFilters (float tone)
 {
@@ -133,103 +139,129 @@ void NightshadeAudioProcessor::updateFilters (float tone)
     const double fs = currentSampleRate;
 
     // ── Input HPF ─────────────────────────────────────────────────────────
-    // C3 (0.1 µF) in series with R6 (1 kΩ):
-    //   fc = 1 / (2π × 1kΩ × 0.1µF) ≈ 1591 Hz
-    // Rolls off everything below ~1.6 kHz before the gain stage, which is
-    // why the real pedal sounds focused / tight rather than muddy.
+    // C3 (0.1 µF) into R6 (1 kΩ): fc = 1 / (2π × 1k × 0.1µ) = 1591 Hz
     {
         auto c = juce::dsp::IIR::Coefficients<float>::makeHighPass (fs, 1591.0, 0.707);
         for (auto& ch : channels) *ch.inputHPF.coefficients = *c;
     }
 
-    // ── Tone stack ────────────────────────────────────────────────────────
-    // 50k pot with 6.8 nF and 1 µF caps (post-clip, between op-amp stages).
-    // tone = 0  → dark  (low-shelf cut   at ~1 kHz, –12 dB)
-    // tone = 0.5 → flat  (shelf gain = 0 dB)
-    // tone = 1  → bright (high-shelf boost at ~8 kHz, +12 dB)
+    // ── Warmth LPF ────────────────────────────────────────────────────────
+    // One-pole low-pass at 6 kHz applied immediately after the clipping stage.
+    // This is the single biggest contributor to the pedal's thick, syrupy
+    // character — it smooths the upper harmonics produced by the waveshaper
+    // before they reach the tone and volume stages.
     {
-        const double fcLow  = 1000.0;
-        const double fcHigh = 8000.0;
-        const double fc     = fcLow * std::pow (fcHigh / fcLow, static_cast<double> (tone));
-
-        if (tone < 0.5f)
-        {
-            const float dB = juce::jmap (tone, 0.0f, 0.5f, -12.0f, 0.0f);
-            auto c = juce::dsp::IIR::Coefficients<float>::makeLowShelf (
-                fs, fc, 0.707, juce::Decibels::decibelsToGain (dB));
-            for (auto& ch : channels) *ch.toneFilter.coefficients = *c;
-        }
-        else
-        {
-            const float dB = juce::jmap (tone, 0.5f, 1.0f, 0.0f, 12.0f);
-            auto c = juce::dsp::IIR::Coefficients<float>::makeHighShelf (
-                fs, fc, 0.707, juce::Decibels::decibelsToGain (dB));
-            for (auto& ch : channels) *ch.toneFilter.coefficients = *c;
-        }
+        auto c = juce::dsp::IIR::Coefficients<float>::makeFirstOrderLowPass (fs, 6000.0);
+        for (auto& ch : channels) *ch.warmthLPF.coefficients = *c;
     }
 
-    // ── Output LPF ────────────────────────────────────────────────────────
-    // 47 pF feedback cap across ~100k: fc = 1/(2π×100k×47pF) ≈ 34 kHz.
-    // Its audio role is minimal (op-amp stability), so we model it as a
-    // very gentle air roll-off at 20 kHz just to tame aliasing artifacts.
+    // ── Tone stack ────────────────────────────────────────────────────────
+    // The real circuit blends two RC paths via the 50k pot:
+    //   LP path (1 µF cap):     theoretical fc = 1/(2π×50k×1µ)   ≈ 3 Hz  → practical min 200 Hz
+    //   HP path (6.8 nF cap):   theoretical fc = 1/(2π×50k×6.8n) ≈ 468 Hz → practical max 8 kHz
+    //
+    // We model this as a complementary LP/HP pair sharing a swept cutoff frequency.
+    // The blend knob morphs linearly from all-LP (tone=0) through 50/50 (tone=0.5)
+    // to all-HP (tone=1).  Because the LP and HP are complementary filters,
+    // their unblended sum equals the original signal, so the mid-point is -6 dB
+    // (equivalent to the real pot at 50% position).
+    //
+    // Frequency sweep: 200 Hz → 8 kHz, logarithmic.
     {
-        auto c = juce::dsp::IIR::Coefficients<float>::makeLowPass (fs, 20000.0, 0.707);
-        for (auto& ch : channels) *ch.outputLPF.coefficients = *c;
+        // Logarithmic frequency sweep:  200 Hz at tone=0, 8 kHz at tone=1
+        const double fc = 200.0 * std::pow (8000.0 / 200.0, static_cast<double> (tone));
+
+        auto lpC = juce::dsp::IIR::Coefficients<float>::makeLowPass  (fs, fc, 0.707);
+        auto hpC = juce::dsp::IIR::Coefficients<float>::makeHighPass (fs, fc, 0.707);
+
+        for (auto& ch : channels)
+        {
+            *ch.toneLPF.coefficients = *lpC;
+            *ch.toneHPF.coefficients = *hpC;
+        }
     }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Clipping functions
+//  updateOutputLPF  — gain-dependent 47 pF feedback cap model
+// ─────────────────────────────────────────────────────────────────────────────
+void NightshadeAudioProcessor::updateOutputLPF (float gainKnob)
+{
+    lastGainKnob = gainKnob;
+
+    // In the real circuit the 47 pF cap sits in parallel with the feedback
+    // resistor (R2 + the GAIN pot wiper), so its cutoff is:
+    //   fc = 1 / (2π × R_feedback × 47pF)
+    //
+    // As gain increases, R_feedback increases and fc moves down into the audio
+    // band, rolling off harshness and adding the characteristic warmth.
+    //
+    //   gainKnob=0  → R = 10 kΩ   → fc ≈ 338 kHz  (inaudible)
+    //   gainKnob=0.5 → R = 260 kΩ  → fc ≈  13 kHz
+    //   gainKnob=1.0 → R = 510 kΩ  → fc ≈   6.6 kHz  (clearly audible warmth)
+
+    const float R_feedback = 10000.0f + gainKnob * 500000.0f;  // 10k – 510k Ω
+    const double fc = 1.0 / (juce::MathConstants<double>::twoPi
+                             * static_cast<double> (R_feedback)
+                             * 47e-12);
+
+    // Clamp to a useful audio range; at low gain the cutoff is above hearing
+    const double fc_clamped = juce::jlimit (2000.0, 20000.0, fc);
+
+    auto c = juce::dsp::IIR::Coefficients<float>::makeLowPass (
+        currentSampleRate, fc_clamped, 0.707);
+    for (auto& ch : channels)
+        *ch.outputLPF.coefficients = *c;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Waveshaper
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Normalised soft-clipper:
-//   f(x, Vf) = (Vf / tanh(1)) * tanh(x / Vf)
-//
-// Why this formula?
-//   tanh alone has slope 1/Vf at x=0, which attenuates quiet signals.
-//   Multiplying by Vf/tanh(1) restores slope = 1 at x = 0, giving
-//   true unity gain when the signal is below the knee.
-//   The output is then divided by Vf so the saturation ceiling is ± 1,
-//   giving a consistent output level regardless of which mode is selected.
-//
-//   Combined: (Vf / tanh(1)) * tanh(x / Vf) / Vf  =  tanh(x / Vf) / tanh(1)
+// f(x) = Vf * asinh(x / Vf)
+// For |x| << Vf : output ≈ x          (linear, no distortion)
+// For |x| >> Vf : output ≈ Vf*ln(2x/Vf)  (logarithmic compression)
 float NightshadeAudioProcessor::diodeClip (float x, float Vf) noexcept
 {
-    return std::tanh (x / Vf) / kTanh1;
+    return Vf * std::asinh (x / Vf);
 }
 
-// Op-amp rail saturation — hardest of the four modes.
-// Uses the tightest Vf (kVf_None = 0.40) through the same normalised function.
+// Hard op-amp rail saturation — models the output stage clipping when no
+// diodes are present in the feedback path.
 float NightshadeAudioProcessor::opAmpSat (float x) noexcept
 {
-    return std::tanh (x / kVf_None) / kTanh1;
+    return std::tanh (x * 3.0f);
 }
 
 float NightshadeAudioProcessor::applyClipping (float x, int mode) noexcept
 {
-    // Clamp mode to valid range — guards against unexpected host values
     mode = juce::jlimit (0, 3, mode);
 
     switch (static_cast<ClipMode> (mode))
     {
         case ClipMode::LED:
+            // f(x) = 2.0 * asinh(x / 2.0)   — soft, symmetric
             return diodeClip (x, kVf_LED);
 
         case ClipMode::Silicon:
+            // f(x) = 0.6 * asinh(x / 0.6)   — tighter knee, symmetric
             return diodeClip (x, kVf_Si);
 
         case ClipMode::Germanium:
-            // Asymmetric: different Vf on each half introduces even-order harmonics.
+            // Positive half: f(x) =  0.3 * asinh(x  / 0.3)
+            // Negative half: f(x) = -0.5 * asinh(-x / 0.5)
+            // Asymmetric response introduces even-order harmonics (warmth).
             if (x >= 0.0f)
                 return  diodeClip ( x, kVf_Ge_pos);
             else
                 return -diodeClip (-x, kVf_Ge_neg);
 
         case ClipMode::None:
+            // f(x) = tanh(x * 3.0) — harder saturation modelling op-amp rails
             return opAmpSat (x);
     }
 
-    return x; // unreachable
+    return x;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -238,13 +270,11 @@ float NightshadeAudioProcessor::applyClipping (float x, int mode) noexcept
 bool NightshadeAudioProcessor::isBusesLayoutSupported (const BusesLayout& layouts) const
 {
     const auto& out = layouts.getMainOutputChannelSet();
-    const auto& in  = layouts.getMainInputChannelSet();
-
     if (out != juce::AudioChannelSet::mono() &&
         out != juce::AudioChannelSet::stereo())
         return false;
 
-    return in == out;
+    return layouts.getMainInputChannelSet() == out;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -255,29 +285,83 @@ void NightshadeAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
 {
     juce::ScopedNoDenormals noDenormals;
 
-    // ── Read parameters directly from APVTS atomics ───────────────────────
-    // Pointers are cached in the constructor — guaranteed non-null.
-    const float gainKnob = rawGain->load();   // normalised [0, 1]
-    const float toneKnob = rawTone->load();   // normalised [0, 1]
-    const float volKnob  = rawVol->load();    // normalised [0, 1]
-    const int   clipMode = static_cast<int> (rawClip->load());   // 0..3
+    // ── Parameter reads (APVTS atomics, lock-free) ────────────────────────
+    const float gainKnob = rawGain->load();
+    const float toneKnob = rawTone->load();
+    const float volKnob  = rawVol->load();
+    const int   clipMode = juce::jlimit (0, 3, static_cast<int> (rawClip->load()));
 
-    // Gain: log-space interpolation across schematic range [10×, 510×]
-    // knob=0.0 → 10×  (+20 dB, minimum gain from R2/R6)
-    // knob=0.5 → ~71× (+37 dB)
-    // knob=1.0 → 510× (+54 dB, full pot travel)
+    // ── Gain staging ──────────────────────────────────────────────────────
+    // Log-space interpolation from schematic values: 10× – 510×
     const float gainLin = kGainMin * std::pow (kGainMax / kGainMin, gainKnob);
 
-    // Volume: square-law taper approximates an audio pot
+    // Post-clip normalisation: scale so LED mode at current gain + 0 dBFS ≈ ±1.
+    // As gain increases, the normaliser compensates to keep loudness consistent.
+    // The result is that the Volume knob is the primary level control regardless
+    // of gain setting — just like the real pedal.
+    const float clipNorm = 1.0f / juce::jmax (1.0f, kVf_LED * std::asinh (gainLin / kVf_LED));
+
+    // Square-law volume taper
     const float volLin = volKnob * volKnob;
 
-    // Rebuild tone coefficients if the knob has moved (cheap comparison)
+    // Tone blend weights (linear blend, 0 = all LP, 1 = all HP)
+    const float lpWeight = 1.0f - toneKnob;
+    const float hpWeight = toneKnob;
+
+    // ── Rebuild filter coefficients if parameters moved ───────────────────
     if (toneKnob != lastTone)
         updateFilters (toneKnob);
+
+    if (gainKnob != lastGainKnob)
+        updateOutputLPF (gainKnob);
 
     const int numChannels = buffer.getNumChannels();
     const int numSamples  = buffer.getNumSamples();
 
+    // ── Stage 1: Input HPF at base rate ───────────────────────────────────
+    // Applied before upsampling so the oversampler never sees DC or sub-bass.
+    for (int ch = 0; ch < numChannels && ch < 2; ++ch)
+    {
+        float* data = buffer.getWritePointer (ch);
+        for (int n = 0; n < numSamples; ++n)
+            data[n] = channels[static_cast<size_t> (ch)].inputHPF.processSample (data[n]);
+    }
+
+    // ── Stage 2: 4× upsample → gain + clip → downsample ──────────────────
+    // Running the waveshaper at 4× sample rate drastically reduces aliasing
+    // artefacts that cause the harsh, buzzy quality at high gain settings.
+    {
+        juce::dsp::AudioBlock<float> block (buffer);
+        auto osBlock = oversampler.processSamplesUp (block);
+
+        const int osChannels = static_cast<int> (osBlock.getNumChannels());
+        const int osSamples  = static_cast<int> (osBlock.getNumSamples());
+
+        for (int ch = 0; ch < osChannels && ch < 2; ++ch)
+        {
+            float* data = osBlock.getChannelPointer (static_cast<size_t> (ch));
+
+            for (int n = 0; n < osSamples; ++n)
+            {
+                float x = data[n];
+
+                // Gain stage — drives signal into the waveshaper
+                x *= gainLin;
+
+                // Waveshaper (diode / op-amp model)
+                x = applyClipping (x, clipMode);
+
+                // Normalise back to ±1 before returning to base rate
+                x *= clipNorm;
+
+                data[n] = x;
+            }
+        }
+
+        oversampler.processSamplesDown (block);
+    }
+
+    // ── Stage 3: Post-clip chain at base rate ─────────────────────────────
     for (int ch = 0; ch < numChannels && ch < 2; ++ch)
     {
         auto&  state = channels[static_cast<size_t> (ch)];
@@ -287,22 +371,21 @@ void NightshadeAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
         {
             float x = data[n];
 
-            // 1. Input coupling HPF  (C3 / R6 model, fc ≈ 1591 Hz)
-            x = state.inputHPF.processSample (x);
+            // Warmth LPF (6 kHz one-pole) — the primary source of the
+            // thick, syrupy character.  Smooths upper harmonics from the
+            // waveshaper before they reach the tone stack.
+            x = state.warmthLPF.processSample (x);
 
-            // 2. Gain stage  (inverting amp, R6 input / R2+GAIN feedback)
-            x *= gainLin;
+            // Tone stack: blend of LP and HP paths (50k pot / 6.8 nF + 1 µF model)
+            const float lpOut = state.toneLPF.processSample (x);
+            const float hpOut = state.toneHPF.processSample (x);
+            x = lpWeight * lpOut + hpWeight * hpOut;
 
-            // 3. Clipping stage  (diodes in feedback loop)
-            x = applyClipping (x, clipMode);
-
-            // 4. Tone stack  (50k pot, 6.8 nF / 1 µF caps)
-            x = state.toneFilter.processSample (x);
-
-            // 5. Output HF rolloff  (47 pF feedback cap model)
+            // Output LPF — gain-dependent 47 pF feedback cap model.
+            // At high gain this rolls off ~6.6 kHz, adding smoothness.
             x = state.outputLPF.processSample (x);
 
-            // 6. Volume trim
+            // Volume trim
             x *= volLin;
 
             data[n] = x;
