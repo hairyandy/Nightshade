@@ -155,30 +155,22 @@ void NightshadeAudioProcessor::updateFilters (float tone)
         for (auto& ch : channels) *ch.warmthLPF.coefficients = *c;
     }
 
-    // ── Tone stack ────────────────────────────────────────────────────────
-    // The real circuit blends two RC paths via the 50k pot:
-    //   LP path (1 µF cap):     theoretical fc = 1/(2π×50k×1µ)   ≈ 3 Hz  → practical min 200 Hz
-    //   HP path (6.8 nF cap):   theoretical fc = 1/(2π×50k×6.8n) ≈ 468 Hz → practical max 8 kHz
+    // ── Tone shelf ────────────────────────────────────────────────────────
+    // The 50k TONE pot blends between the 6.8 nF (treble) and 1 µF (bass)
+    // capacitor paths, acting as a variable treble control.
     //
-    // We model this as a complementary LP/HP pair sharing a swept cutoff frequency.
-    // The blend knob morphs linearly from all-LP (tone=0) through 50/50 (tone=0.5)
-    // to all-HP (tone=1).  Because the LP and HP are complementary filters,
-    // their unblended sum equals the original signal, so the mid-point is -6 dB
-    // (equivalent to the real pot at 50% position).
+    // Modelled as a first-order high shelf centred at 1 kHz:
+    //   tone=0.0 (CCW) → -14 dB shelf  — warm, full bass, highs rolled off
+    //   tone=0.5 (centre) → 0 dB       — flat, no insertion loss
+    //   tone=1.0 (CW) → +14 dB shelf   — bright, upper harmonics accentuated
     //
-    // Frequency sweep: 200 Hz → 8 kHz, logarithmic.
+    // Using toneHPF as the shelf; toneLPF is unused.
     {
-        // Logarithmic frequency sweep:  200 Hz at tone=0, 8 kHz at tone=1
-        const double fc = 200.0 * std::pow (8000.0 / 200.0, static_cast<double> (tone));
-
-        auto lpC = juce::dsp::IIR::Coefficients<float>::makeFirstOrderLowPass  (fs, fc);
-        auto hpC = juce::dsp::IIR::Coefficients<float>::makeFirstOrderHighPass (fs, fc);
-
+        const float shelfGainDb = (tone - 0.5f) * 28.0f;       // -14 … +14 dB
+        const float shelfGain   = juce::Decibels::decibelsToGain (shelfGainDb);
+        auto c = juce::dsp::IIR::Coefficients<float>::makeHighShelf (fs, 1000.0, 0.707, shelfGain);
         for (auto& ch : channels)
-        {
-            *ch.toneLPF.coefficients = *lpC;
-            *ch.toneHPF.coefficients = *hpC;
-        }
+            *ch.toneHPF.coefficients = *c;
     }
 }
 
@@ -208,8 +200,9 @@ void NightshadeAudioProcessor::updateOutputLPF (float gainKnob)
     // Clamp to a useful audio range; at low gain the cutoff is above hearing
     const double fc_clamped = juce::jlimit (2000.0, 20000.0, fc);
 
-    auto c = juce::dsp::IIR::Coefficients<float>::makeLowPass (
-        currentSampleRate, fc_clamped, 0.707);
+    // One RC pole in the feedback path = first-order roll-off, not biquad.
+    auto c = juce::dsp::IIR::Coefficients<float>::makeFirstOrderLowPass (
+        currentSampleRate, fc_clamped);
     for (auto& ch : channels)
         *ch.outputLPF.coefficients = *c;
 }
@@ -304,9 +297,6 @@ void NightshadeAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
     // Square-law volume taper
     const float volLin = volKnob * volKnob;
 
-    // Tone blend weights (linear blend, 0 = all LP, 1 = all HP)
-    const float lpWeight = 1.0f - toneKnob;
-    const float hpWeight = toneKnob;
 
     // ── Rebuild filter coefficients if parameters moved ───────────────────
     if (toneKnob != lastTone)
@@ -376,16 +366,10 @@ void NightshadeAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
             // waveshaper before they reach the tone stack.
             x = state.warmthLPF.processSample (x);
 
-            // Tone stack: blend of LP and HP paths (50k pot / 6.8 nF + 1 µF model)
-            const float lpOut = state.toneLPF.processSample (x);
-            const float hpOut = state.toneHPF.processSample (x);
-            x = lpWeight * lpOut + hpWeight * hpOut;
-
-            // Makeup gain — compensates for the tone pot insertion loss.
-            // The passive RC blend loses up to 6 dB at the mid position
-            // (tone=0.5); the real circuit's SECRETB second op-amp provides
-            // a fixed ~6 dB recovery, modelled here as a constant 2× gain.
-            x *= 2.0f;
+            // Tone shelf — high-shelf from -14 dB (CCW) to +14 dB (CW),
+            // flat at centre.  Models the 50k pot / 6.8 nF + 1 µF RC network
+            // via SECRETB with no insertion loss at the mid position.
+            x = state.toneHPF.processSample (x);
 
             // Output LPF — gain-dependent 47 pF feedback cap model.
             // At high gain this rolls off ~6.6 kHz, adding smoothness.
