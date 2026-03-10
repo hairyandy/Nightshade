@@ -139,9 +139,13 @@ void NightshadeAudioProcessor::updateFilters (float tone)
     const double fs = currentSampleRate;
 
     // ── Input HPF ─────────────────────────────────────────────────────────
-    // C3 (0.1 µF) into R6 (1 kΩ): fc = 1 / (2π × 1k × 0.1µ) = 1591 Hz
+    // C3 (0.1 µF) + R6 (1 kΩ) into virtual ground gives fc = 1591 Hz if
+    // the source impedance is 0 Ω.  In hardware a guitar's ~250 kΩ output
+    // impedance dominates, lowering the effective fc to ~6 Hz.  We model
+    // this as an 80 Hz one-pole HPF — passes all guitar fundamentals
+    // (low E = 82 Hz), blocks sub-bass mud before the high-gain stage.
     {
-        auto c = juce::dsp::IIR::Coefficients<float>::makeHighPass (fs, 1591.0, 0.707);
+        auto c = juce::dsp::IIR::Coefficients<float>::makeFirstOrderHighPass (fs, 80.0);
         for (auto& ch : channels) *ch.inputHPF.coefficients = *c;
     }
 
@@ -288,14 +292,31 @@ void NightshadeAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
     // Log-space interpolation from schematic values: 10× – 510×
     const float gainLin = kGainMin * std::pow (kGainMax / kGainMin, gainKnob);
 
-    // Post-clip normalisation: scale so LED mode at current gain + 0 dBFS ≈ ±1.
-    // As gain increases, the normaliser compensates to keep loudness consistent.
-    // The result is that the Volume knob is the primary level control regardless
-    // of gain setting — just like the real pedal.
-    const float clipNorm = 1.0f / juce::jmax (1.0f, kVf_LED * std::asinh (gainLin / kVf_LED));
+    // Per-mode post-clip normalisation — each mode is normalised to the same
+    // peak output level so the audible difference is tonal character (soft/hard
+    // knee, symmetric vs asymmetric harmonics), not just a volume shift.
+    const float clipNormMax = [&]() -> float
+    {
+        switch (static_cast<ClipMode> (clipMode))
+        {
+            case ClipMode::LED:
+                return kVf_LED * std::asinh (gainLin / kVf_LED);
+            case ClipMode::Silicon:
+                return kVf_Si  * std::asinh (gainLin / kVf_Si);
+            case ClipMode::Germanium:
+                // Use the softer (negative) half's Vf so we don't over-compress
+                return kVf_Ge_neg * std::asinh (gainLin / kVf_Ge_neg);
+            case ClipMode::None:
+                return 1.0f;   // tanh output is bounded by ±1
+        }
+        return 1.0f;
+    }();
+    const float clipNorm = 1.0f / juce::jmax (1.0f, clipNormMax);
 
-    // Square-law volume taper
-    const float volLin = volKnob * volKnob;
+    // Square-law volume taper with +12 dB of headroom above the normalised
+    // clipper level — a real overdrive pedal is significantly louder than
+    // the dry signal at max volume.
+    const float volLin = volKnob * volKnob * 4.0f;
 
 
     // ── Rebuild filter coefficients if parameters moved ───────────────────
