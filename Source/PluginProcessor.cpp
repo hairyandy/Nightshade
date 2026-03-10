@@ -25,8 +25,8 @@ static const juce::String kClipID = "clipmode";
 // ─────────────────────────────────────────────────────────────────────────────
 static constexpr float kVf_LED    = 2.0f;
 static constexpr float kVf_Si     = 0.6f;
-static constexpr float kVf_Ge_pos = 0.3f;
-static constexpr float kVf_Ge_neg = 0.5f;
+static constexpr float kVf_Ge_pos = 0.15f;   // 1N34A: very low Vf, hard asymmetric clip
+static constexpr float kVf_Ge_neg = 0.25f;
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Gain range  — from the Nightshade schematic
@@ -163,16 +163,17 @@ void NightshadeAudioProcessor::updateFilters (float tone)
     // The 50k TONE pot blends between the 6.8 nF (treble) and 1 µF (bass)
     // capacitor paths, acting as a variable treble control.
     //
-    // Modelled as a first-order high shelf centred at 1 kHz:
-    //   tone=0.0 (CCW) → -14 dB shelf  — warm, full bass, highs rolled off
+    // Modelled as a high shelf centred at 700 Hz (Q=0.6 for a smooth,
+    // wide transition that doesn't peak in the 2–4 kHz "nasal" zone):
+    //   tone=0.0 (CCW) → -10 dB shelf  — warm, bass-forward, highs rolled off
     //   tone=0.5 (centre) → 0 dB       — flat, no insertion loss
-    //   tone=1.0 (CW) → +14 dB shelf   — bright, upper harmonics accentuated
+    //   tone=1.0 (CW) → +10 dB shelf   — bright, presence lifted from ~1 kHz up
     //
     // Using toneHPF as the shelf; toneLPF is unused.
     {
-        const float shelfGainDb = (tone - 0.5f) * 28.0f;       // -14 … +14 dB
+        const float shelfGainDb = (tone - 0.5f) * 20.0f;       // -10 … +10 dB
         const float shelfGain   = juce::Decibels::decibelsToGain (shelfGainDb);
-        auto c = juce::dsp::IIR::Coefficients<float>::makeHighShelf (fs, 1000.0, 0.707, shelfGain);
+        auto c = juce::dsp::IIR::Coefficients<float>::makeHighShelf (fs, 700.0, 0.6, shelfGain);
         for (auto& ch : channels)
             *ch.toneHPF.coefficients = *c;
     }
@@ -227,7 +228,9 @@ float NightshadeAudioProcessor::diodeClip (float x, float Vf) noexcept
 // diodes are present in the feedback path.
 float NightshadeAudioProcessor::opAmpSat (float x) noexcept
 {
-    return std::tanh (x * 3.0f);
+    // tanh × 2.0 gives a slightly softer rail saturation than × 3.0,
+    // better modelling the TL072's finite slew rate at the clipping boundary.
+    return std::tanh (x * 2.0f);
 }
 
 float NightshadeAudioProcessor::applyClipping (float x, int mode) noexcept
@@ -289,8 +292,11 @@ void NightshadeAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
     const int   clipMode = juce::jlimit (0, 3, static_cast<int> (rawClip->load()));
 
     // ── Gain staging ──────────────────────────────────────────────────────
-    // Log-space interpolation from schematic values: 10× – 510×
-    const float gainLin = kGainMin * std::pow (kGainMax / kGainMin, gainKnob);
+    // Square-root knob shaping front-loads the gain curve so that distortion
+    // kicks in early in the knob travel (around 1 o'clock ≈ 25%), matching
+    // the feel of the real pedal where gain beyond noon is already quite heavy.
+    const float gainKnobShaped = std::sqrt (gainKnob);
+    const float gainLin = kGainMin * std::pow (kGainMax / kGainMin, gainKnobShaped);
 
     // Per-mode post-clip normalisation — each mode is normalised to the same
     // peak output level so the audible difference is tonal character (soft/hard
@@ -307,7 +313,10 @@ void NightshadeAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
                 // Use the softer (negative) half's Vf so we don't over-compress
                 return kVf_Ge_neg * std::asinh (gainLin / kVf_Ge_neg);
             case ClipMode::None:
-                return 1.0f;   // tanh output is bounded by ±1
+                // tanh produces a near-square wave at high gain; its RMS is
+                // significantly higher than the diode modes at the same peak.
+                // A factor of 1.8 brings the perceived loudness in line.
+                return 1.8f;
         }
         return 1.0f;
     }();
@@ -398,6 +407,11 @@ void NightshadeAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
 
             // Volume trim
             x *= volLin;
+
+            // Safety hard-clip: prevents IIR filter state divergence when
+            // extreme gain + tone settings push the signal far above ±1.
+            // ±4.0 gives +12 dB of DAW headroom while stopping runaway.
+            x = juce::jlimit (-4.0f, 4.0f, x);
 
             data[n] = x;
         }

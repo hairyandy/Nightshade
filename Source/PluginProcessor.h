@@ -81,10 +81,10 @@ private:
     float lastTone     { -1.0f };
     float lastGainKnob { -1.0f };
 
-    // 4× oversampler — used exclusively for the clipping stage to prevent aliasing.
-    // Constructed with 2 channels, factor 2 (2^2 = 4×).
+    // 8× oversampler — used exclusively for the clipping stage to prevent aliasing.
+    // Constructed with 2 channels, factor 3 (2^3 = 8×).
     juce::dsp::Oversampling<float> oversampler {
-        2, 2, juce::dsp::Oversampling<float>::filterHalfBandPolyphaseIIR };
+        2, 3, juce::dsp::Oversampling<float>::filterHalfBandPolyphaseIIR };
 
     // Direct APVTS parameter pointers — cached in constructor, always valid.
     std::atomic<float>* rawGain { nullptr };
