@@ -55,7 +55,7 @@ NightshadeAudioProcessor::createParameterLayout()
 
     layout.add (std::make_unique<juce::AudioParameterFloat> (
         kVolID, "Vol",
-        juce::NormalisableRange<float> (0.0f, 1.0f, 0.001f), 0.75f));
+        juce::NormalisableRange<float> (0.0f, 1.0f, 0.001f), 0.5f));  // 0.5² × 4.0 = 1.0 = unity gain
 
     layout.add (std::make_unique<juce::AudioParameterChoice> (
         kClipID, "Clip Mode",
@@ -159,23 +159,22 @@ void NightshadeAudioProcessor::updateFilters (float tone)
         for (auto& ch : channels) *ch.warmthLPF.coefficients = *c;
     }
 
-    // ── Tone shelf ────────────────────────────────────────────────────────
-    // The 50k TONE pot blends between the 6.8 nF (treble) and 1 µF (bass)
-    // capacitor paths, acting as a variable treble control.
+    // ── Tone LP ───────────────────────────────────────────────────────────
+    // First-order swept low-pass models the 50k TONE pot + RC network.
+    // Cut-only (never boosts) so the tone control cannot drive the output
+    // into clipping regardless of position.
     //
-    // Modelled as a high shelf centred at 700 Hz (Q=0.6 for a smooth,
-    // wide transition that doesn't peak in the 2–4 kHz "nasal" zone):
-    //   tone=0.0 (CCW) → -10 dB shelf  — warm, bass-forward, highs rolled off
-    //   tone=0.5 (centre) → 0 dB       — flat, no insertion loss
-    //   tone=1.0 (CW) → +10 dB shelf   — bright, presence lifted from ~1 kHz up
+    //   tone=0.0 (CCW) → fc =  400 Hz  — heavy treble cut, warm and dark
+    //   tone=0.5 (ctr) → fc ≈ 1.8 kHz  — natural presence
+    //   tone=1.0 (CW)  → fc = 8 kHz   — essentially flat, full harmonics
     //
-    // Using toneHPF as the shelf; toneLPF is unused.
+    // fc = 400 × 20^tone  (logarithmic sweep)
+    // Using toneLPF; toneHPF is unused.
     {
-        const float shelfGainDb = (tone - 0.5f) * 20.0f;       // -10 … +10 dB
-        const float shelfGain   = juce::Decibels::decibelsToGain (shelfGainDb);
-        auto c = juce::dsp::IIR::Coefficients<float>::makeHighShelf (fs, 700.0, 0.6, shelfGain);
+        const double fc = 400.0 * std::pow (20.0, static_cast<double> (tone));
+        auto c = juce::dsp::IIR::Coefficients<float>::makeFirstOrderLowPass (fs, fc);
         for (auto& ch : channels)
-            *ch.toneHPF.coefficients = *c;
+            *ch.toneLPF.coefficients = *c;
     }
 }
 
@@ -396,21 +395,25 @@ void NightshadeAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
             // waveshaper before they reach the tone stack.
             x = state.warmthLPF.processSample (x);
 
-            // Tone shelf — high-shelf from -14 dB (CCW) to +14 dB (CW),
-            // flat at centre.  Models the 50k pot / 6.8 nF + 1 µF RC network
-            // via SECRETB with no insertion loss at the mid position.
-            x = state.toneHPF.processSample (x);
+            // Tone LP — swept first-order LPF (400 Hz → 8 kHz).
+            // Cut-only; never boosts so it cannot interact with clipping.
+            x = state.toneLPF.processSample (x);
 
             // Output LPF — gain-dependent 47 pF feedback cap model.
             // At high gain this rolls off ~6.6 kHz, adding smoothness.
             x = state.outputLPF.processSample (x);
 
-            // Volume trim
+            // Pre-volume clip: the filter chain (cut-only tone LP + output LPF)
+            // keeps the signal within ±1.  This clip is a safety net for any
+            // unexpected spikes and — crucially — ensures the volume control
+            // operates on a clean bounded signal so it never interacts with
+            // the distortion character.
+            x = juce::jlimit (-1.0f, 1.0f, x);
+
+            // Volume trim (+12 dB headroom: 0.5² × 4 = unity at default)
             x *= volLin;
 
-            // Safety hard-clip: prevents IIR filter state divergence when
-            // extreme gain + tone settings push the signal far above ±1.
-            // ±4.0 gives +12 dB of DAW headroom while stopping runaway.
+            // Post-volume safety clip — stops runaway at extreme settings
             x = juce::jlimit (-4.0f, 4.0f, x);
 
             data[n] = x;
