@@ -37,7 +37,17 @@ void GrindstoneLogoType::paint(juce::Graphics& g)
 {
     if (logoImage.isValid())
     {
-        g.drawImage(logoImage, getLocalBounds().toFloat(), juce::RectanglePlacement::centred);
+        // Scale to fill the component width, maintaining aspect ratio,
+        // centred vertically.
+        const float srcW  = (float)logoImage.getWidth();
+        const float srcH  = (float)logoImage.getHeight();
+        const float scale = (float)getWidth() / srcW;
+        const float dstH  = srcH * scale;
+        const float dstY  = ((float)getHeight() - dstH) * 0.5f;
+        g.drawImage(logoImage,
+                    0, juce::roundToInt(dstY),
+                    getWidth(), juce::roundToInt(dstH),
+                    0, 0, (int)srcW, (int)srcH);
         return;
     }
 

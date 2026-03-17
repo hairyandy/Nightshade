@@ -39,6 +39,7 @@ public:
     // Optional extra component placed between logotype and washer.
     // Caller retains ownership; GrindstonePedalFace only lays it out.
     void setExtraComponent(juce::Component* component);
+    void setLogoImage(const juce::Image& img) { logotype.setImage(img); }
 
     std::function<void(bool)> onBypassChanged;
 

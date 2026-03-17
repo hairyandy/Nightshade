@@ -161,21 +161,26 @@ void GrindstonePedalFace::paint(juce::Graphics& g)
         g.setFont(juce::Font(fontSize, juce::Font::bold));
 
         const int labelCount = juce::jmin(knobs.size(), storedKnobLabels.size());
+        const float lh = fontSize + 3.0f;
+
+        // For 3-knob layout: all three labels share the same y, centred in the
+        // gap between the top row and the TONE knob row.
+        const bool useSharedY = (knobs.size() == 3);
+        float sharedLabelY = 0.0f;
+        if (useSharedY)
+        {
+            const float topRowBottom = (float)knobs[0]->getBounds().getBottom();
+            const float toneTop      = (float)knobs[2]->getBounds().getY();
+            sharedLabelY = (topRowBottom + toneTop) * 0.5f - lh * 0.5f - 3.0f;
+        }
 
         for (int i = 0; i < labelCount; ++i)
         {
             const juce::String& lbl = storedKnobLabels[i];
             if (lbl.isEmpty()) continue;
 
-            const auto kb = knobs[i]->getBounds().toFloat();
-            const float lh = fontSize + 3.0f;
-            float ly;
-
-            // TONE (index 2 in 3-knob layout) gets its label above
-            if (knobs.size() == 3 && i == 2)
-                ly = kb.getY() - lh - 1.0f;
-            else
-                ly = kb.getBottom() + 1.0f;
+            const auto  kb = knobs[i]->getBounds().toFloat();
+            const float ly = useSharedY ? sharedLabelY : kb.getBottom() + 1.0f;
 
             const juce::Rectangle<float> shadow { kb.getX() + 0.5f, ly + 1.0f, kb.getWidth(), lh };
             const juce::Rectangle<float> main   { kb.getX(),          ly,         kb.getWidth(), lh };
@@ -221,8 +226,9 @@ void GrindstonePedalFace::resized()
     const int washerTop = h - washerH;
 
     // ── Logo + extra-component strip (stacked upward from washerTop) ──────────
-    const int logoH  = 8;
-    const int logoW  = juce::roundToInt((float)w * 0.80f);
+    // logoW: Reveal's targetW (164 px) scaled up 10 % for Nightshade.
+    const int logoH  = 26;
+    const int logoW  = 180;
     const int logoX  = (w - logoW) / 2;
 
     // Clip selector (extra component) fills the gap between logo and washer
@@ -264,9 +270,9 @@ void GrindstonePedalFace::resized()
         const int spacing     = juce::roundToInt((float)w * 0.06f);   // 12 px at w=200
         const int totalTopW   = topKnobSize * 2 + spacing;
         const int topStartX   = (w - totalTopW) / 2;
-        const int topKnobY    = 22;
-        knobs[0]->setBounds(topStartX,                          topKnobY, topKnobSize, topKnobSize);
-        knobs[1]->setBounds(topStartX + topKnobSize + spacing,  topKnobY, topKnobSize, topKnobSize);
+        const int topKnobY    = 12;
+        knobs[0]->setBounds(topStartX - 7,                          topKnobY, topKnobSize, topKnobSize);
+        knobs[1]->setBounds(topStartX + topKnobSize + spacing + 7,  topKnobY, topKnobSize, topKnobSize);
 
         // Label strip (9 px) between the two rows — labels drawn in paint()
         const int labelStripH = 9;

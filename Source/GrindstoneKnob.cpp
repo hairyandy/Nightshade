@@ -171,7 +171,7 @@ void GrindstoneKnob::resized()
         const float outerR = 78.0f * scale;
         const float cy     = outerR;
         const float cx     = (float)getWidth() * 0.5f;
-        const float knobDiam = (innerR - scale) * 2.0f;
+        const float knobDiam = (innerR - scale) * 2.0f * 1.20f;
         slider.setBounds(juce::roundToInt(cx - knobDiam * 0.5f),
                          juce::roundToInt(cy - knobDiam * 0.5f),
                          juce::roundToInt(knobDiam),
