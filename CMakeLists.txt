@@ -60,11 +60,22 @@ juce_add_plugin(Nightshade
 juce_generate_juce_header(Nightshade)
 
 # ============================================================
+# Binary data (embedded assets)
+# ============================================================
+juce_add_binary_data(NightshadeData SOURCES
+    Resources/GWasher.jpg.svg
+)
+
+# ============================================================
 # Source files
 # ============================================================
 target_sources(Nightshade PRIVATE
     Source/PluginProcessor.cpp
     Source/PluginEditor.cpp
+    Source/GWasherButton.cpp
+    Source/GrindstoneKnob.cpp
+    Source/GrindstoneLogoType.cpp
+    Source/GrindstonePedalFace.cpp
 )
 
 # ============================================================
@@ -83,6 +94,7 @@ target_compile_definitions(Nightshade
 # ============================================================
 target_link_libraries(Nightshade
     PRIVATE
+        NightshadeData
         juce::juce_audio_utils
         juce::juce_audio_processors
         juce::juce_dsp
